@@ -49,6 +49,10 @@ def _install_stub() -> None:
             self.chain.append(("image", path))
             return self
 
+        def message(self, text):
+            self.chain.append(("text", text))
+            return self
+
     event_mod.MessageChain = MessageChain
     api.event = event_mod
     sys.modules["astrbot.api.event"] = event_mod
@@ -63,6 +67,8 @@ from astrbot_plugin_youtube_notifier.services.notifier import (  # noqa: E402
     classify_send_error,
 )
 from astrbot_plugin_youtube_notifier.services.models import (  # noqa: E402
+    TYPE_LIVE_END,
+    TYPE_LIVE_START,
     TYPE_NEW_VIDEO,
     Notification,
 )
@@ -214,8 +220,9 @@ def test_send_outcome_states() -> None:
     assert not bad.ok
     assert "失败" in bad.describe()
 
-    # 渲染失败：连图片都没有
-    assert SendOutcome(error="图片渲染失败").image_path is None
+    # 内容生成失败：未进入发送阶段
+    failed = SendOutcome(error="通知内容生成失败")
+    assert failed.image_path is None and failed.rendered is False
     print("✅ test_send_outcome_states")
 
 
@@ -258,6 +265,71 @@ def test_dispatch_test_render_failure_has_no_path() -> None:
     print("✅ test_dispatch_test_render_failure_has_no_path")
 
 
+def test_text_notification_format_and_send() -> None:
+    """文字模式应跳过图片渲染，按配置直接发送 Plain 文本。"""
+    ctx = FakeContext()
+    notifier = _notifier(ctx, FakeRenderer(fail=True), notify_style="text")
+    notification = _notification()
+    notification.start_time = "2026-09-18T15:03:00+00:00"
+    asyncio.run(notifier.dispatch("UC1", [notification]))
+
+    assert len(ctx.sent) == 1
+    chain = ctx.sent[0][1].chain
+    assert chain[0][0] == "text"
+    text = chain[0][1]
+    assert "📺 测试频道 发布了新视频" in text
+    assert "标题: 测试标题" in text
+    assert "开始: " in text
+    assert "链接: https://www.youtube.com/watch?v=x" in text
+    print("✅ test_text_notification_format_and_send")
+
+
+def test_text_formats_all_notification_types() -> None:
+    notifier = _notifier(FakeContext(), FakeRenderer(), notify_style="text")
+    start = Notification(
+        type=TYPE_LIVE_START, channel_name="白上フブキ", title="【歌】",
+        start_time="2026-09-18T15:03:00+00:00", url="https://youtu.be/start",
+    )
+    end = Notification(
+        type=TYPE_LIVE_END, channel_name="白上フブキ", title="【歌】",
+        start_time="2026-09-18T15:03:00+00:00",
+        end_time="2026-09-18T16:03:00+00:00", duration_seconds=3600,
+        url="https://youtu.be/end",
+    )
+    assert notifier._format_text(start).splitlines()[0] == "🔴 白上フブキ 开播了"
+    end_text = notifier._format_text(end)
+    assert end_text.splitlines()[0] == "⚫ 白上フブキ 下播了"
+    assert "开始: " in end_text and "结束: " in end_text and "时长: 1:00:00" in end_text
+
+    no_time = _notification()
+    no_time.start_time = "not-an-iso-time"
+    assert not any(line == "开始: " for line in notifier._format_text(no_time).splitlines())
+    print("✅ test_text_formats_all_notification_types")
+
+
+def test_text_test_notification_has_prefix() -> None:
+    ctx = FakeContext()
+    outcome = asyncio.run(
+        _notifier(ctx, FakeRenderer(fail=True), notify_style="text").dispatch_test(
+            "sess:1", _notification()
+        )
+    )
+    assert outcome.delivered and outcome.rendered
+    assert outcome.image_path is None
+    assert ctx.sent[0][1].chain[0][1].startswith("🧪 [测试]\n")
+    print("✅ test_text_test_notification_has_prefix")
+
+
+def test_text_title_is_truncated() -> None:
+    notifier = _notifier(FakeContext(), FakeRenderer(), notify_style="text")
+    notification = _notification()
+    notification.title = "长" * 101
+    text = notifier._format_text(notification)
+    title_line = next(line for line in text.splitlines() if line.startswith("标题: "))
+    assert title_line == "标题: " + "长" * 100 + "…"
+    print("✅ test_text_title_is_truncated")
+
+
 def test_dispatch_timeout_warns_once() -> None:
     """真实推送里的超时只告警一次，之后降 debug —— 否则每条通知都刷 WARN。"""
     ctx = FakeContext(ActionFailed(NAPCAT_TIMEOUT_TEXT))
@@ -296,20 +368,28 @@ def test_dispatch_success_does_not_warn() -> None:
 
 
 def test_no_retry_on_uncertain_send() -> None:
-    """超时后绝不能重试 —— 会重复推送（用户收到两张一样的图）。"""
-    ctx = FakeContext(ActionFailed(NAPCAT_TIMEOUT_TEXT))
-    notifier = _notifier(ctx, FakeRenderer())
-    calls = {"n": 0}
-    original = ctx.send_message
+    """图片/文字通知超时后都绝不能重试，且重复超时只首次 WARN。"""
+    for style in ("image", "text"):
+        ctx = FakeContext(ActionFailed(NAPCAT_TIMEOUT_TEXT))
+        notifier = _notifier(ctx, FakeRenderer(), notify_style=style)
+        calls = {"n": 0}
+        original = ctx.send_message
 
-    async def counting(session, chain):
-        calls["n"] += 1
-        return await original(session, chain)
+        async def counting(session, chain):
+            calls["n"] += 1
+            return await original(session, chain)
 
-    ctx.send_message = counting
-    asyncio.run(notifier.dispatch("UC1", [_notification()]))
-    assert calls["n"] == 1, f"重试了！调用 {calls['n']} 次 → 会重复推送"
-    print("✅ test_no_retry_on_uncertain_send")
+        ctx.send_message = counting
+        with _LogCapture() as cap:
+            for _ in range(2):
+                asyncio.run(notifier.dispatch("UC1", [_notification()]))
+        assert calls["n"] == 2, (
+            f"style={style} 单次通知发生重试！2 条通知共调用 {calls['n']} 次"
+        )
+        assert len(cap.warnings) == 1, (
+            f"style={style} 超时应只首次 WARN，实际 {len(cap.warnings)} 次"
+        )
+    print("✅ test_no_retry_on_uncertain_send (image + text)")
 
 
 def main() -> int:
@@ -321,6 +401,10 @@ def main() -> int:
         test_dispatch_test_reports_uncertain,
         test_dispatch_test_reports_hard_failure,
         test_dispatch_test_render_failure_has_no_path,
+        test_text_notification_format_and_send,
+        test_text_formats_all_notification_types,
+        test_text_test_notification_has_prefix,
+        test_text_title_is_truncated,
         test_dispatch_timeout_warns_once,
         test_dispatch_hard_failure_always_warns,
         test_dispatch_success_does_not_warn,

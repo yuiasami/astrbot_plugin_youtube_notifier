@@ -43,7 +43,7 @@ from .models import (
 )
 from .page_json import ChannelPageClient
 from .state_machine import find_new_videos, process_live
-from ..utils import utc_now_iso
+from ..utils import format_duration, format_time_zh, utc_now_iso
 
 _DEFAULT_ENABLED = {
     TYPE_LIVE_START: True,
@@ -74,7 +74,7 @@ _UNCERTAIN_SEND_HINTS = (
 
 @dataclass
 class SendOutcome:
-    """一次图片推送的结果。
+    """一次通知推送的结果。
 
     区分三态而不是「成功/失败」二元：
       delivered=True             确认送达
@@ -83,6 +83,7 @@ class SendOutcome:
     """
 
     image_path: Optional[str] = None
+    rendered: bool = False
     delivered: bool = False
     uncertain: bool = False
     error: str = ""
@@ -139,6 +140,7 @@ class NotificationService:
         max_results: int = 5,
         image_dir: Path = Path("data/images"),
         enabled: Optional[dict] = None,
+        notify_style: str = "image",
     ):
         self.context = context
         self.store = store
@@ -152,6 +154,12 @@ class NotificationService:
         self.cover_download = cover_download
         self.max_results = max(1, min(50, int(max_results)))
         self.image_dir = Path(image_dir)
+        if notify_style not in ("image", "text"):
+            logger.warning(
+                f"[YT] 未知通知样式 {notify_style!r}，已回落为 image"
+            )
+            notify_style = "image"
+        self.notify_style = notify_style
         self._enabled = dict(_DEFAULT_ENABLED)
         if enabled:
             self._enabled.update(enabled)
@@ -437,38 +445,49 @@ class NotificationService:
             logger.debug(f"[YT] channel={channel_id} 无订阅会话，跳过推送")
             return
         for n in notifications:
-            path, render_err = await self._render_safe(n)
-            if not path:
+            if self.notify_style == "text":
+                payload, generate_err = self._format_text_safe(n)
+            else:
+                payload, generate_err = await self._render_safe(n)
+            if not payload:
                 logger.warning(
-                    f"[YT] 通知渲染失败 type={n.type} video={n.video_id}: "
-                    f"{render_err}"
+                    f"[YT] 通知内容生成失败 type={n.type} video={n.video_id}: "
+                    f"{generate_err}"
                 )
                 continue
             for session in sessions:
-                outcome = await self._send_image(session, path)
-                if outcome.delivered:
-                    logger.info(
-                        f"[YT] 已推送 {n.type} → session={session} "
-                        f"channel={channel_id} video={n.video_id or '-'}"
-                    )
-                elif outcome.uncertain:
-                    # 常见于 NapCat：适配器超时但图已送达。不重试（会重复推送），
-                    # 只首次告警，之后降为 debug —— 否则每条通知都刷一条 WARN。
-                    msg = (
-                        f"[YT] {n.type} 推送适配器上报超时，消息可能已送达，"
-                        f"已跳过重试 session={session} video={n.video_id or '-'}: "
-                        f"{outcome.error}"
-                    )
-                    if not self._send_timeout_warned:
-                        self._send_timeout_warned = True
-                        logger.warning(msg)
-                    else:
-                        logger.debug(msg)
+                if self.notify_style == "text":
+                    outcome = await self._send_text(session, payload)
                 else:
-                    logger.warning(
-                        f"[YT] 推送失败 session={session} type={n.type}: "
-                        f"{outcome.error}"
-                    )
+                    outcome = await self._send_image(session, payload)
+                self._log_send_outcome(channel_id, session, n, outcome)
+
+    def _log_send_outcome(
+        self, channel_id: str, session: str, n: Notification, outcome: SendOutcome
+    ) -> None:
+        """统一记录图片/文字通知的三态发送结果。"""
+        if outcome.delivered:
+            logger.info(
+                f"[YT] 已推送 {n.type} → session={session} "
+                f"channel={channel_id} video={n.video_id or '-'}"
+            )
+        elif outcome.uncertain:
+            # 常见于 NapCat：适配器超时但消息已送达。不重试（会重复推送），
+            # 只首次告警，之后降为 debug —— 否则每条通知都刷一条 WARN。
+            msg = (
+                f"[YT] {n.type} 推送适配器上报超时，消息可能已送达，"
+                f"已跳过重试 session={session} video={n.video_id or '-'}: "
+                f"{outcome.error}"
+            )
+            if not self._send_timeout_warned:
+                self._send_timeout_warned = True
+                logger.warning(msg)
+            else:
+                logger.debug(msg)
+        else:
+            logger.warning(
+                f"[YT] 推送失败 session={session} type={n.type}: {outcome.error}"
+            )
 
     async def _render_safe(
         self, n: Notification, *, test: bool = False
@@ -490,6 +509,67 @@ class NotificationService:
             return None, "渲染器未返回图片路径"
         return path, ""
 
+    def _format_text(self, n: Notification) -> str:
+        """把通知格式化为纯文字；标签与图片模板保持一致。"""
+        channel = (n.channel_name or n.channel_id or "未知频道").strip()
+        title = (n.title or "（无标题）").strip()
+        if len(title) > 100:
+            title = title[:100] + "…"
+        start_time = format_time_zh(n.start_time)
+        end_time = format_time_zh(n.end_time)
+        url = (n.url or "").strip()
+
+        if n.type == TYPE_LIVE_START:
+            lines = [f"🔴 {channel} 开播了", f"标题: {title}"]
+            if start_time:
+                lines.append(f"开始: {start_time}")
+        elif n.type == TYPE_LIVE_END:
+            lines = [f"⚫ {channel} 下播了", f"标题: {title}"]
+            if start_time:
+                lines.append(f"开始: {start_time}")
+            if end_time:
+                lines.append(f"结束: {end_time}")
+            if n.duration_seconds:
+                lines.append(f"时长: {format_duration(n.duration_seconds)}")
+        else:
+            lines = [f"📺 {channel} 发布了新视频", f"标题: {title}"]
+            if start_time:
+                lines.append(f"开始: {start_time}")
+        if url:
+            lines.append(f"链接: {url}")
+        return "\n".join(lines)
+
+    def _format_text_safe(
+        self, n: Notification, *, test: bool = False
+    ) -> tuple[Optional[str], str]:
+        """生成文字通知；失败返回 (None, 原因)，绝不向上抛异常。"""
+        try:
+            text = self._format_text(n)
+        except Exception as exc:  # noqa: BLE001 - 单条格式化失败不影响其它通知
+            logger.error(
+                f"[YT] 格式化文字通知异常 type={n.type} video={n.video_id}: {exc!r}"
+            )
+            return None, _short_error(f"{type(exc).__name__}: {exc}")
+        if not text.strip():
+            return None, "文字通知内容为空"
+        if test:
+            text = f"🧪 [测试]\n{text}"
+        return text, ""
+
+    async def _send_text(self, session: str, text: str) -> SendOutcome:
+        """发送纯文字通知并分类结果。"""
+        try:
+            await self.context.send_message(session, MessageChain().message(text))
+        except Exception as exc:  # noqa: BLE001 - 适配器异常五花八门
+            uncertain, reason = classify_send_error(exc)
+            return SendOutcome(
+                rendered=True,
+                delivered=False,
+                uncertain=uncertain,
+                error=reason,
+            )
+        return SendOutcome(rendered=True, delivered=True)
+
     async def _send_image(self, session: str, image_path: str) -> SendOutcome:
         """发送一张图并分类结果（确认成功 / 超时但可能已送达 / 确认失败）。"""
         try:
@@ -500,11 +580,12 @@ class NotificationService:
             uncertain, reason = classify_send_error(exc)
             return SendOutcome(
                 image_path=image_path,
+                rendered=True,
                 delivered=False,
                 uncertain=uncertain,
                 error=reason,
             )
-        return SendOutcome(image_path=image_path, delivered=True)
+        return SendOutcome(image_path=image_path, rendered=True, delivered=True)
 
     async def _render_notification(
         self, n: Notification, *, test: bool = False
@@ -524,21 +605,26 @@ class NotificationService:
     async def dispatch_test(
         self, session: str, notification: Notification
     ) -> SendOutcome:
-        """渲染并推送一条测试通知，返回 SendOutcome。
+        """生成并推送一条测试通知，返回 SendOutcome。
 
         供 /yt直播测试 /yt视频测试 使用：走的是与真实推送**完全相同**的
-        渲染 + 发送链路，但标记为测试（图上会有「测试」字样），
-        且不触碰任何去重状态。
+        内容生成 + 发送链路，但额外标记为测试，且不触碰任何去重状态。
         """
-        path, render_err = await self._render_safe(notification, test=True)
-        if not path:
+        if self.notify_style == "text":
+            payload, generate_err = self._format_text_safe(notification, test=True)
+        else:
+            payload, generate_err = await self._render_safe(notification, test=True)
+        if not payload:
             logger.warning(
-                f"[YT] 测试通知渲染失败 type={notification.type} "
-                f"video={notification.video_id}: {render_err}"
+                f"[YT] 测试通知内容生成失败 type={notification.type} "
+                f"video={notification.video_id}: {generate_err}"
             )
-            return SendOutcome(error=f"图片渲染失败：{render_err}")
+            return SendOutcome(error=f"通知内容生成失败：{generate_err}")
 
-        outcome = await self._send_image(session, path)
+        if self.notify_style == "text":
+            outcome = await self._send_text(session, payload)
+        else:
+            outcome = await self._send_image(session, payload)
         if outcome.delivered:
             logger.info(
                 f"[YT] 已推送测试通知 {notification.type} → session={session} "

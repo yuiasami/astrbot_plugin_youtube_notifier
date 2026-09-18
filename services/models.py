@@ -56,6 +56,8 @@ class ChannelState:
     video_seeded: bool = False
 
     # 直播状态机
+    # 是否已完成过一次直播状态观测/播种；不是「是否正在直播」。
+    live_seeded: bool = False
     last_live_id: str = ""
     last_status: str = STATUS_NONE
     last_live_start_at: str = ""  # ISO8601
@@ -82,6 +84,10 @@ class ChannelState:
         # 说明此前已播种过，避免升级后被当成首次接入而漏推。
         if "video_seeded" not in kwargs and kwargs.get("last_video_id"):
             kwargs["video_seeded"] = True
+        # 老订阅都已经走过订阅时的直播播种流程，只是当时没有这个字段。
+        # 升级后视为已播种，确保下一次开播会正常通知。
+        if "live_seeded" not in kwargs:
+            kwargs["live_seeded"] = True
         return cls(**kwargs)
 
     def mark_live_notified(self, video_id: str) -> None:

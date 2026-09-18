@@ -1,6 +1,6 @@
 """AstrBot YouTube 订阅提醒插件。
 
-订阅 YouTube 频道，直播上播/下播与新投稿以「文生图」图片通知推送。
+订阅 YouTube 频道，直播上播/下播与新投稿支持图片或文字通知推送。
 订阅按会话（unified_msg_origin）隔离。
 
 指令：
@@ -9,8 +9,8 @@
     /yt批量订阅 <目标> <目标>...   批量订阅（空格分隔）
     /yt批量取消订阅 <目标>...      批量取消订阅（空格分隔）
     /yt列表                       查看本会话订阅
-    /yt直播测试 <目标>            抓目标直播并渲染推送一张测试图
-    /yt视频测试 <目标>            抓目标最新视频并渲染推送一张测试图
+    /yt直播测试 <目标>            抓目标直播并推送一条测试通知
+    /yt视频测试 <目标>            抓目标最新视频并推送一条测试通知
 """
 
 from __future__ import annotations
@@ -141,8 +141,8 @@ _SUBSCRIBE_FAIL_SHORT = {
 @register(
     PLUGIN_NAME,
     "yuiasami",
-    "订阅 YouTube 频道，直播上/下播与新投稿以图片形式推送。",
-    "v1.0.1",
+    "订阅 YouTube 频道，直播上/下播与新投稿支持图片或文字推送。",
+    "v1.1.0",
 )
 class YouTubeNotifierPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -213,11 +213,19 @@ class YouTubeNotifierPlugin(Star):
         # —— 用户把 ttf 丢进去即可，无需挂载宿主机字库、也无需配 font_path。
         register_font_dirs([self.data_dir / "fonts"])
 
-        self.renderer = NotificationRenderer(
-            image_width=int(render_cfg.get("image_width", 800) or 800),
-            font_path=str(render_cfg.get("font_path", "") or ""),
-            output_dir=self.data_dir / "images" / "notifications",
-        )
+        notify_style = str(
+            notify_cfg.get("style", "image") or "image"
+        ).strip().lower()
+        if notify_style == "text":
+            # 文字模式不初始化 PIL/字体链，确保「无需字体」不仅是发送阶段跳过渲染，
+            # 启动时也不会因缺少中文字体产生无关报错。
+            self.renderer = None
+        else:
+            self.renderer = NotificationRenderer(
+                image_width=int(render_cfg.get("image_width", 800) or 800),
+                font_path=str(render_cfg.get("font_path", "") or ""),
+                output_dir=self.data_dir / "images" / "notifications",
+            )
         renderer = self.renderer
         mode = str(basic.get("live_detect_mode", "data_api") or "data_api")
         self.notifier = NotificationService(
@@ -233,6 +241,7 @@ class YouTubeNotifierPlugin(Star):
             cover_download=bool(basic.get("cover_download", True)),
             max_results=int(basic.get("max_results", 5) or 5),
             image_dir=self.data_dir / "images" / "covers",
+            notify_style=notify_style,
             enabled={
                 TYPE_LIVE_START: bool(notify_cfg.get("live_start_enabled", True)),
                 TYPE_LIVE_END: bool(notify_cfg.get("live_end_enabled", True)),
@@ -359,7 +368,7 @@ class YouTubeNotifierPlugin(Star):
             yield event.plain_result(
                 f"已订阅频道: {outcome.name}\n"
                 f"频道ID: {outcome.channel_id}\n"
-                "直播上/下播与新投稿将以图片通知推送。\n\n"
+                f"直播上/下播与新投稿将以{self._notification_style_text()}推送。\n\n"
                 f"⚠️ {notice}"
             )
             return
@@ -367,7 +376,7 @@ class YouTubeNotifierPlugin(Star):
         yield event.plain_result(
             f"已订阅频道: {outcome.name}\n"
             f"频道ID: {outcome.channel_id}\n"
-            "直播上/下播与新投稿将以图片通知推送。"
+            f"直播上/下播与新投稿将以{self._notification_style_text()}推送。"
         )
 
     @filter.command("yt批量订阅", alias={"yt_batch_subscribe", "youtube批量订阅"})
@@ -499,7 +508,7 @@ class YouTubeNotifierPlugin(Star):
 
     @filter.command("yt直播测试", alias={"yt_live_test", "youtube直播测试"})
     async def live_test(self, event: AstrMessageEvent, target: str = ""):
-        """抓取目标当前直播并渲染推送一张直播通知图（测试渲染与推送链路）
+        """抓取目标当前直播并推送一条测试通知（测试生成与推送链路）
 
         用法: /yt直播测试 <@handle 或 频道ID 或 频道URL 或 视频URL>
         """
@@ -509,7 +518,7 @@ class YouTubeNotifierPlugin(Star):
 
     @filter.command("yt视频测试", alias={"yt_video_test", "youtube视频测试"})
     async def video_test(self, event: AstrMessageEvent, target: str = ""):
-        """抓取目标最新视频并渲染推送一张新投稿通知图（测试渲染与推送链路）
+        """抓取目标最新视频并推送一条测试通知（测试生成与推送链路）
 
         用法: /yt视频测试 <@handle 或 频道ID 或 频道URL 或 视频URL>
         """
@@ -523,8 +532,8 @@ class YouTubeNotifierPlugin(Star):
         "  {cmd} @NASA\n"
         "  {cmd} https://www.youtube.com/@MrBeast\n"
         "  {cmd} https://www.youtube.com/watch?v=gTKS8SAwUzE\n"
-        "说明: 测试命令会真实抓取数据并渲染推送一张图"
-        "（图上带「🧪 测试」标记），用于验证渲染与推送链路是否正常。"
+        "说明: 测试命令会真实抓取数据并按当前通知样式推送一条通知"
+        "（带「🧪 测试」标记），用于验证内容生成与推送链路是否正常。"
     )
 
     async def _run_test(self, event: AstrMessageEvent, target: str, *, want_live: bool) -> str:
@@ -559,11 +568,11 @@ class YouTubeNotifierPlugin(Star):
         note = ""
         if want_live and not data.is_live_now:
             note = (
-                "\n⚠️ 注意：该视频**当前不在直播**，这张图是借用它的信息生成的样例"
+                "\n⚠️ 注意：该视频**当前不在直播**，这条通知是借用它的信息生成的样例"
                 "（真实推送只会在检测到直播时发出）。"
             )
         elif not want_live and data.is_live_now:
-            note = "\n⚠️ 注意：该视频**正在直播**，新投稿通知图仅作渲染效果展示。"
+            note = "\n⚠️ 注意：该视频**正在直播**，新投稿通知仅作样式效果展示。"
 
         notification = Notification(
             type=TYPE_LIVE_START if want_live else TYPE_NEW_VIDEO,
@@ -610,12 +619,12 @@ class YouTubeNotifierPlugin(Star):
                 # 没在直播：也没法可靠找到「最近一场直播」——
                 # 网页数据里 /streams 只保留直播，往期直播存档与普通投稿
                 # 无法区分（角标一样，见 services/page_json.py）。
-                # 如实说明：这张图只是借用最新投稿验证渲染链路。
+                # 如实说明：这条通知只是借用最新投稿验证通知链路。
                 chosen = entries[0]
                 note = (
                     "\n⚠️ 该频道**当前没有直播**。网页数据无法可靠找出往期直播，"
-                    f"这张图借用最新投稿（{chosen.title[:30]}）的信息生成，"
-                    "仅用于验证渲染效果。"
+                    f"这条通知借用最新投稿（{chosen.title[:30]}）的信息生成，"
+                    "仅用于验证通知效果。"
                 )
             start_time = chosen.actual_start_time or chosen.published_at
         else:
@@ -623,7 +632,7 @@ class YouTubeNotifierPlugin(Star):
             chosen = regular[0]
             start_time = chosen.published_at
             if chosen.was_live:
-                note = "\n⚠️ 该频道最近只有直播内容，这张图借用直播存档生成。"
+                note = "\n⚠️ 该频道最近只有直播内容，这条通知借用直播存档生成。"
 
         notification = Notification(
             type=TYPE_LIVE_START if want_live else TYPE_NEW_VIDEO,
@@ -668,15 +677,17 @@ class YouTubeNotifierPlugin(Star):
     async def _push_test(
         self, session: str, notification: Notification, *, source: str, note: str = ""
     ) -> str:
-        """渲染并推送测试图，返回给用户的文字说明。"""
+        """生成并推送测试通知，返回给用户的文字说明。"""
         outcome = await self.notifier.dispatch_test(session, notification)
+        style = self._notification_style_text()
 
         header = (
             f"🧪 测试通知已推送（{source}）\n"
             f"标题: {notification.title or '（无标题）'}\n"
             f"频道: {notification.channel_name or notification.channel_id or '未知'}\n"
             f"链接: {notification.url}\n"
-            f"渲染链路与真实推送完全一致，仅图上多了「测试」标记。{note}"
+            f"内容生成与真实推送完全一致，测试通知额外带有测试标记。"
+            f"当前样式：{style}。{note}"
         )
 
         if outcome.delivered:
@@ -689,24 +700,34 @@ class YouTubeNotifierPlugin(Star):
                 f"🧪 测试通知已发送（{source}），但适配器上报了超时：\n"
                 f"  {outcome.error}\n"
                 "这通常是 NapCat/QQ 适配器的已知现象：消息**实际已经送达**，"
-                "只是适配器等「消息列表更新」事件超时。请先确认上方是否已收到图片；\n"
+                "只是适配器等「消息列表更新」事件超时。请先确认上方是否已收到通知；\n"
                 "插件不会因此重试（重试会导致重复推送）。\n\n"
                 + header.split("\n", 1)[1]
             )
 
-        if outcome.image_path:
+        if outcome.rendered:
             return (
-                f"图片已渲染成功，但推送到本会话失败（{source}）。\n"
+                f"通知内容已生成成功，但推送到本会话失败（{source}）。\n"
                 f"原因: {outcome.error}\n"
-                "渲染链路是好的，问题在会话/适配器侧（机器人是否在线、"
+                "内容生成链路是好的，问题在会话/适配器侧（机器人是否在线、"
                 "会话是否有效、是否有发言权限）。"
             )
+        if self.notifier.notify_style == "image":
+            return (
+                f"通知图片生成失败（{source}）。\n"
+                f"原因: {outcome.error}\n"
+                "图片生成失败通常是字体缺失或配置问题，可运行 "
+                "`python scripts/diagnose.py --check-fonts` 自查。"
+            )
         return (
-            f"渲染失败（{source}）。\n"
+            f"文字通知生成失败（{source}）。\n"
             f"原因: {outcome.error}\n"
-            "渲染失败通常是字体缺失或配置问题，可运行 "
-            "`python scripts/diagnose.py --check-fonts` 自查。"
+            "请检查日志中的文字格式化异常。"
         )
+
+    def _notification_style_text(self) -> str:
+        """当前通知样式的用户可见名称。"""
+        return "纯文字通知" if self.notifier.notify_style == "text" else "图片通知"
 
     # ------------------------------------------------------------ 订阅公共实现
 
@@ -954,7 +975,10 @@ class YouTubeNotifierPlugin(Star):
         必须能出现在聊天里（不只日志）：缺中文字体的表现是「图里全是方框」，
         用户看不出原因，只会以为插件坏了。
         """
-        if self.renderer is None or getattr(self.renderer, "cjk_ok", True):
+        if (
+            self.notifier is not None
+            and self.notifier.notify_style == "text"
+        ) or self.renderer is None or getattr(self.renderer, "cjk_ok", True):
             return ""
         fonts_dir = self.data_dir / "fonts"
         return (

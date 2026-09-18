@@ -207,6 +207,7 @@ def test_seed_silent() -> None:
     state = ChannelState(channel_id="UC_TEST")
     feed = parse_feed(FEED_XML, "UC_TEST")
     seed_channel_from_feed(state, feed)
+    assert state.live_seeded is True
     assert state.last_video_id == "VID002", state.last_video_id
     assert state.last_status == STATUS_LIVE, state.last_status
     assert state.last_live_id == "LIVE001"
@@ -214,14 +215,41 @@ def test_seed_silent() -> None:
 
 
 def test_live_none_to_live_is_silent() -> None:
-    """首次接入（none→live）静默记录，不推送。"""
+    """未经 seed_channel_from_feed 播种的裸状态机首次观测直播时静默。"""
     state = ChannelState(channel_id="UC_X")
     live = LiveInfo(live_id="L1", title="直播一", start_time=NOW, url="u")
     notes = process_live(live, state, NOW)
     assert notes == [], f"首次接入不应推送: {notes}"
+    assert state.live_seeded is True
     assert state.last_status == STATUS_LIVE
     assert state.last_live_id == "L1"
     print("✅ test_live_none_to_live_is_silent")
+
+
+def test_live_after_seed_is_notified() -> None:
+    """订阅时未在播，之后第一次真正开播必须通知。"""
+    state = ChannelState(channel_id="UC_X")
+    seed_channel_from_feed(state, FeedResult("UC_X", "测试频道", []))
+    assert state.live_seeded is True
+    assert state.last_status == STATUS_NONE
+
+    live = LiveInfo(live_id="L1", title="直播一", start_time=NOW, url="u")
+    notes = process_live(live, state, NOW)
+    assert len(notes) == 1 and notes[0].type == TYPE_LIVE_START, notes
+    assert notes[0].video_id == "L1"
+    print("✅ test_live_after_seed_is_notified")
+
+
+def test_live_seed_self_heals_after_failed_seed() -> None:
+    """订阅播种失败后，首轮无直播观测应置位，之后开播必须通知。"""
+    state = ChannelState(channel_id="UC_X")
+    assert process_live(None, state, NOW) == []
+    assert state.live_seeded is True
+
+    live = LiveInfo(live_id="L1", title="直播一", start_time=NOW, url="u")
+    notes = process_live(live, state, NOW)
+    assert len(notes) == 1 and notes[0].type == TYPE_LIVE_START, notes
+    print("✅ test_live_seed_self_heals_after_failed_seed")
 
 
 def test_live_dedup_same_id() -> None:
@@ -426,14 +454,16 @@ def test_empty_snapshot_does_not_mark_seeded() -> None:
 
 
 def test_legacy_state_migration() -> None:
-    """旧状态文件没有 video_seeded：有 last_video_id 时应视为已播种。"""
+    """旧状态文件缺少播种字段时按各自语义迁移。"""
     old = {"channel_id": "UC_X", "last_video_id": "VID1", "last_status": "ended"}
     st = ChannelState.from_dict(old)
-    assert st.video_seeded is True, "有 last_video_id 的旧状态应迁移为已播种"
+    assert st.video_seeded is True, "有 last_video_id 的旧状态应迁移为投稿已播种"
+    assert st.live_seeded is True, "旧状态应无条件迁移为直播已播种"
 
-    old2 = {"channel_id": "UC_Y"}  # 从未播种过
+    old2 = {"channel_id": "UC_Y"}  # 从未播种过投稿，但仍是既有订阅
     st2 = ChannelState.from_dict(old2)
     assert st2.video_seeded is False
+    assert st2.live_seeded is True, "直播播种迁移不能依赖 last_video_id"
     print("✅ test_legacy_state_migration")
 
 
@@ -469,6 +499,8 @@ def main() -> int:
         test_real_feed_thumbnail_selection,
         test_seed_silent,
         test_live_none_to_live_is_silent,
+        test_live_after_seed_is_notified,
+        test_live_seed_self_heals_after_failed_seed,
         test_live_dedup_same_id,
         test_live_start_after_ended,
         test_live_end_with_duration,

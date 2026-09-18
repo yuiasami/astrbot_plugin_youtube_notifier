@@ -1,7 +1,7 @@
 name: astrbot_plugin_youtube_notifier # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
 display_name: YouTube 订阅提醒 # 用于展示的名字
-desc: 订阅 YouTube 频道，直播上播/下播与新投稿以图片形式推送。支持 Atom feed（任意频道，无鉴权）、LiveBroadcasts API（OAuth，自己的频道）与 WebSub 实时推送三种数据源。
-version: v1.0.1 # 插件版本号。格式：v1.1.1 或者 v1.1
+desc: 订阅 YouTube 频道，直播上播/下播与新投稿支持图片或文字推送。支持 Data API、网页 JSON 兜底、legacy Atom feed 与可选 WebSub。
+version: v1.1.0 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: yuiasami # 作者
 repo: https://github.com/yuiasami/astrbot_plugin_youtube_notifier # 插件的仓库地址
 astrbot_version: ">=4.20.0" # 需要的最低 AstrBot 版本

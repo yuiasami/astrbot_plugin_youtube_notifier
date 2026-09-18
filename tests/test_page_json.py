@@ -446,6 +446,7 @@ def test_stream_vod_not_notified_as_new_video() -> None:
     state = ChannelState(
         channel_id="UCLA_DiR1FfKNvjuUpBHmylQ",
         video_seeded=True,
+        live_seeded=True,
         last_status=STATUS_ENDED,
         last_live_id="OLDLIVEID01",
     )

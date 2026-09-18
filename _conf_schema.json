@@ -114,6 +114,13 @@
     "type": "object",
     "hint": "按通知类型控制是否推送。",
     "items": {
+      "style": {
+        "description": "通知样式",
+        "type": "string",
+        "default": "image",
+        "options": ["image", "text"],
+        "hint": "image=PIL 渲染图片通知（默认）；text=纯文字通知，不下载封面、不渲染图片，速度更快、无需字体，适合低配机器或不希望群里刷屏图片的场景。"
+      },
       "live_start_enabled": {
         "description": "上播通知",
         "type": "bool",

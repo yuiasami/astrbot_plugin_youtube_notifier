@@ -88,6 +88,7 @@ class ChannelState:
     channel_handle: str        # 用户输入的 @handle 形式，便于展示
     uploads_playlist_id: str   # channels.list 得到，缓存避免重复消耗配额
     last_video_id: str         # 投稿去重
+    live_seeded: bool          # 是否完成过直播状态观测/播种，不代表正在直播
     last_live_id: str          # 直播去重
     last_status: str           # none / live / ended
     last_live_start_at: str
@@ -112,7 +113,7 @@ class ChannelState:
 
 ```
 上播: 有 live 且 last_status!=live 且 id 变化 → live_start
-      （首次接入 last_status==none 时若已在直播 → 只记状态不推送）
+      （仅在 live_seeded=false 且从未见过直播状态时，首次观测已在直播才静默播种）
 下播: last_status==live 且当前无 live → live_end（时长用 actualEndTime 优先）
 防重复: 同一 live_id 只推一次；并写入 recent_live_ids
 ```
@@ -167,6 +168,9 @@ class ChannelState:
    真实 entry 子元素为 `[author, channelId, group, id, link, published, title, updated, videoId]`；
    这两个直播信号字段只在直播时出现。**直播场景的 feed 解析未经真实样本验证**
    —— 这也是以 Data API 为主数据源的原因之一。
+4. **`last_status` 不能兼任直播播种标志**：频道订阅时没在直播，`last_status` 会长期保持
+   `none`；若据此判断「首次接入」，频道之后第一次真正开播就会被永久静默吞掉。
+   已改用独立的 `live_seeded`（见 `services/state_machine.py`）。
 
 ## AstrBot API 事实（已验证，勿改用不存在的 API）
 
@@ -182,6 +186,9 @@ class ChannelState:
   `import PIL`，所以 pillow 是硬依赖（曾漏列）
 - 后台任务：`asyncio.create_task` 在 `initialize()` 中启动；`terminate()` 中取消。无 `register_task` API
 - 主动推送：`await self.context.send_message(umo, MessageChain().file_image(path))`
+- 已查 AstrBot v4.28.0 源码确认：`MessageChain.message(text)` 会追加 `Plain(text)` 并返回
+  `self`，可与 `.file_image()` 混用；`context.send_message()` 主动推送不经过
+  `result_decorate` pipeline stage，因此 t2i 文本转图片 / 合并转发阈值不会作用于插件主动推送。
 - 指令回复：`yield event.plain_result(text)` / `yield event.chain_result(chain)`
 - 命令别名：`@filter.command("yt订阅", alias={"yt_subscribe"})`；typed 参数 `x: str = ""` 自动解析
 - **指令参数是「逐 token」绑定的（实测源码）**：`astrbot/core/star/filter/command.py`
@@ -206,7 +213,7 @@ class ChannelState:
 5. **日志**：状态变化、推送记录（会话、video）、配额消耗、WebSub 校验失败均需打日志
 6. **模块单职**：`services/` 不得 import `main.py`；渲染 / 网络 / 状态机解耦
 7. **凭据安全**：API Key / token / client_secret 不写日志、不入 git（`data/`、`*_config.json` 已 gitignore）
-8. 通知必须走**图片**；`/yt列表` 允许文本回复
+8. 通知默认走**图片**，可通过 `notify.style=text` 切换为纯文字通知；`/yt列表` 允许文本回复
 9. 中文字体：`msyh.ttc` → `simhei.ttf` → `NotoSansCJK` → `DejaVuSans.ttf`；`font_path` 可覆盖
 10. emoji：微软雅黑**不含彩色 emoji**（会渲染成豆腐块）。必须用 `utils.draw_text_with_emoji`
     （emoji 段用 `seguiemj.ttf` + `embedded_color`），并对齐字形墨迹避免裁切
@@ -339,9 +346,14 @@ Windows GBK 控制台需 `sys.stdout.reconfigure(encoding="utf-8")` 才能打印
 
 ## 待验证（诚实记录）
 
-- **AstrBot 内端到端**（`/yt订阅` → 收到图片通知）尚未在真实 bot 里跑过 ——
+- **AstrBot 内端到端**（`/yt订阅` → 收到通知）尚未在真实 bot 里跑过 ——
   唯一剩下的主要验证项。`/yt直播测试` `/yt视频测试` 正是为缩小这个缺口加的：
-  它们走完整「抓取 → 渲染 → 推送」链路，可在真实 bot 里直接验证。
+  它们走完整「抓取 → 内容生成 → 推送」链路，可在真实 bot 里直接验证。
+- text 通知模式尚未在真实 bot 环境端到端验证；QQ（NapCat 等适配器）对包含
+  `youtube.com` 链接的纯文本消息是否存在风控/限流未知。图片模式的链接是像素图，
+  不触发同一风险；这是 text 模式新增的潜在风险点。
+- **已知限制（本轮不修）**：不同会话重复订阅同一频道时会重跑全局频道状态播种，
+  可能吞掉其它会话原本应收到的一条上播或投稿通知；后续需单独设计会话/全局播种边界。
 - WebSub 与真实 hub 的握手未验证（且端点已不可靠，默认关闭）
 - feed 场景的**直播**信号未取得真实样本（feed 已降级，影响有限）
 - 网页 JSON 的**预告/首播角标**（`_BADGE_UPCOMING`）未取得真实样本，

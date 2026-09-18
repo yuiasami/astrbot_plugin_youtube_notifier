@@ -3,7 +3,7 @@
 状态转移（ChannelState.last_status: none / live / ended）：
 
     上播: 当前有 live 且 (last_status != live 或 last_live_id 变化) → live_start
-          例外: 频道首次接入（last_status==none）若已在直播 → 只记状态不推送
+          例外: 尚未完成直播播种且从未见过直播状态时，首次观测到直播只记状态不推送
     下播: last_status==live 且当前无 live → live_end（记录 end_at，计算时长）
     防重复: 同一 live_id 已在 live 状态 → 不重复发上播
 """
@@ -47,11 +47,15 @@ def process_live(
         live: 当前处于直播的流，None 表示无直播。
         state: 频道状态（会被原地修改）。
         now_iso: 当前时间 ISO 字符串。
-        silent_initial: 首次接入（none→live）时是否静默记录不推送。
+        silent_initial: 未播种时首次观测到直播是否静默记录不推送。
         ended_at_iso: 已知的直播实际结束时间（Data API 的 actualEndTime），
                       用于计算更准确的时长；为空则用 now_iso。
     """
     notifications: list[Notification] = []
+    # 每次成功观测都算完成直播播种；必须早于所有早退分支，才能让
+    # 「订阅时播种失败、首轮轮询无直播」的场景自行恢复。
+    was_seeded = state.live_seeded
+    state.live_seeded = True
 
     if live is None:
         # 无直播：上一次在直播 → 下播
@@ -79,8 +83,8 @@ def process_live(
     # 记为「已作为直播通知过」，防止下播后该 VOD 又被当成新投稿推送
     state.mark_live_notified(live.live_id)
 
-    if prev_status == STATUS_NONE and silent_initial:
-        # 频道首次接入且已在直播：静默记录，不打扰用户
+    if (not was_seeded) and prev_status == STATUS_NONE and silent_initial:
+        # 未完成播种且首次观测时已经在直播：静默记录，不打扰用户
         logger.info(
             f"[YT] channel={state.channel_id} 首次接入已在直播 id={state.last_live_id}，"
             "静默记录不推送"
@@ -170,6 +174,7 @@ def find_new_videos(
 
 def seed_channel_from_feed(state: ChannelState, feed: FeedResult) -> None:
     """订阅新频道时静默播种状态：标记最新投稿与当前直播，避免装好即刷屏。"""
+    state.live_seeded = True
     state.channel_name = feed.channel_name or state.channel_name
     if feed.entries:
         # 无论有没有普通投稿都标记已播种：主播型频道（上传列表全是直播存档）
