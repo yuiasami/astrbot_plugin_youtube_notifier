@@ -5,6 +5,19 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.1.1] - 2026-09-23
+
+### 修复
+
+- **修复后台日志被降级链刷爆的问题**。`auto` 模式未配置 API Key 时，每个频道每轮
+  轮询都会打一条「未配置 API Key，回退网页数据源」（实测该行占满用户整个日志文件，
+  体积增长极快）。同类问题还有配额耗尽、Key 无效、Data API 拉取失败、网页兜底失败、
+  LiveBroadcasts 检测失败等——这些都是**长期状态而非事件**，现在统一改为
+  「同一频道同一原因只按原级别记一次，之后降为 debug」（`NotificationService._log_once`）。
+  降级留痕不受影响：状态变化仍由 `_mark_degraded` 记 INFO，用户可见信息仍由
+  `degraded_reason()` → `/yt列表` 与订阅回复提供。频道恢复后会清除标记，
+  下次再降级会重新告警一次（不会一降级就永久静默）。
+
 ## [v1.1.0] - 2026-09-18
 
 ### 新增

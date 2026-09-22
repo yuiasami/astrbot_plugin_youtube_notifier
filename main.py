@@ -142,7 +142,7 @@ _SUBSCRIBE_FAIL_SHORT = {
     PLUGIN_NAME,
     "yuiasami",
     "订阅 YouTube 频道，直播上/下播与新投稿支持图片或文字推送。",
-    "v1.1.0",
+    "v1.1.1",
 )
 class YouTubeNotifierPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):

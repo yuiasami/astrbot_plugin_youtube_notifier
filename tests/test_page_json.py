@@ -645,6 +645,125 @@ def test_notifier_uses_page_json_without_api_key() -> None:
     print("✅ test_notifier_uses_page_json_without_api_key")
 
 
+def test_repeated_poll_does_not_spam_logs() -> None:
+    """长期降级状态不能每轮每频道都刷日志。
+
+    复现真实故障：auto 模式 + 未配置 API Key + 多频道持续轮询时，
+    每个频道每轮都打一条「未配置 API Key，回退网页数据源」，
+    把用户的后台日志撑爆（实测该行占满整个日志文件）。
+    """
+    import logging
+
+    from astrbot_plugin_youtube_notifier.services.notifier import NotificationService
+
+    class _Store:
+        def __init__(self, states):
+            self._states = states
+
+        def get_channel_state(self, cid):
+            return self._states[cid]
+
+        def set_channel_name(self, cid, name):
+            self._states[cid].channel_name = name
+
+        def sessions_for_channel(self, cid):
+            return []
+
+        async def save(self):
+            pass
+
+    class _NoKeyAPI:
+        configured = False
+
+    channels = [f"UC{i:022d}" for i in range(3)]
+    states = {
+        cid: ChannelState(channel_id=cid, channel_handle="@x",
+                          uploads_playlist_id="UUx", name_from_api=False,
+                          video_seeded=True)
+        for cid in channels
+    }
+    session = FakeSession({
+        "/videos": _html_with(_load(NORMAL_FIXTURE)),
+        "/streams": _html_with(_load(LIVE_FIXTURE)),
+    })
+    notifier = NotificationService(
+        context=object(), store=_Store(states), renderer=object(),
+        data_api=_NoKeyAPI(),
+        page_json=pj.ChannelPageClient(session, min_interval=0),
+        live_detect_mode="auto", page_fallback_enabled=True,
+    )
+
+    records: list = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    target = logging.getLogger("astrbot_test")
+    target.addHandler(handler)
+    target.setLevel(logging.DEBUG)
+    try:
+        for _ in range(4):  # 4 轮轮询 × 3 频道
+            for cid in channels:
+                asyncio.run(notifier.check_channel(cid))
+    finally:
+        target.removeHandler(handler)
+
+    spam = [
+        r
+        for r in records
+        if r.levelno >= logging.INFO and "未配置 API Key" in r.getMessage()
+    ]
+    assert len(spam) == 1, (
+        f"「未配置 API Key」应只记 1 次，实际 {len(spam)} 次"
+        "（3 频道 × 4 轮 = 12 次调用，修复前会刷 12 条）"
+    )
+    # 降级痕迹必须仍然保留（不能靠「不打日志」来止刷）
+    for cid in channels:
+        assert "API Key" in notifier.degraded_reason(cid), "降级留痕丢了"
+    print("✅ test_repeated_poll_does_not_spam_logs")
+
+
+def test_recovery_rearms_the_warning() -> None:
+    """降级恢复后再降级，必须重新告警一次（否则复发就静默了）。"""
+    import logging
+
+    from astrbot_plugin_youtube_notifier.services.notifier import NotificationService
+
+    records: list = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    target = logging.getLogger("astrbot_test")
+    target.addHandler(handler)
+    target.setLevel(logging.DEBUG)
+    try:
+        notifier = NotificationService(
+            context=object(), store=object(), renderer=object()
+        )
+
+        def visible() -> list:
+            """只看没被降级的（>= WARNING），debug 重复不算。"""
+            return [
+                r
+                for r in records
+                if r.levelno >= logging.WARNING and "配额耗尽" in r.getMessage()
+            ]
+
+        notifier._log_once("quota", "UC1", "配额耗尽 UC1", logging.ERROR)
+        notifier._log_once("quota", "UC1", "配额耗尽 UC1", logging.ERROR)
+        assert len(visible()) == 1, f"同因应只记 1 次，实际 {len(visible())}"
+
+        # 该频道恢复 → 清标记
+        notifier._degraded["UC1"] = "配额"
+        notifier._clear_degraded("UC1")
+        notifier._log_once("quota", "UC1", "配额耗尽 UC1", logging.ERROR)
+        assert len(visible()) == 2, "恢复后再降级应重新告警"
+
+        # 另一个频道不受影响，各自独立计一次
+        notifier._log_once("quota", "UC2", "配额耗尽 UC2", logging.ERROR)
+        assert len(visible()) == 3, "不同频道应各自告警一次"
+    finally:
+        target.removeHandler(handler)
+    print("✅ test_recovery_rearms_the_warning")
+
+
 def test_semantic_errors_are_not_retried() -> None:
     """语义性错误（Key 无效/配额耗尽/频道不存在）不能进重试循环。
 
@@ -745,6 +864,8 @@ def main() -> int:
         test_regular_video_after_fallback_is_still_notified,
         test_notifier_falls_back_on_quota,
         test_notifier_uses_page_json_without_api_key,
+        test_repeated_poll_does_not_spam_logs,
+        test_recovery_rearms_the_warning,
         test_semantic_errors_are_not_retried,
         test_runtime_degradation_is_surfaced,
     ]

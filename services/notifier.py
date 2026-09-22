@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -164,7 +165,9 @@ class NotificationService:
         if enabled:
             self._enabled.update(enabled)
         self._channel_locks: dict[str, asyncio.Lock] = {}
-        self._api_key_warned = False
+        # 降级链上的重复性告警只按原级别记一次，键 = (原因, channel_id)。
+        # channel_id 为空串表示全局条件（缺 Key / Key 无效）。
+        self._logged_once: set[tuple[str, str]] = set()
         # 适配器「超时但其实已送达」只告警一次，之后降 debug（见 dispatch）
         self._send_timeout_warned = False
         # 降级原因（channel_id → 原因），供 /yt列表 与订阅回复展示
@@ -201,6 +204,26 @@ class NotificationService:
         cid = str(channel_id)
         if self._degraded.pop(cid, None) is not None:
             logger.info(f"[YT] channel={cid} 已恢复使用 Data API")
+        # 恢复后清掉该频道的「已告警」标记：下次再降级要重新告警一次，
+        # 否则用户只在首次降级时被告知，之后复发就静默了。
+        self._logged_once = {k for k in self._logged_once if k[1] != cid}
+
+    def _log_once(
+        self, reason: str, channel_id: str, msg: str, level: int = logging.WARNING
+    ) -> None:
+        """同一 (原因, 频道) 只按原级别记一次，之后降 debug。
+
+        「降级」是长期状态而不是事件：每轮每频道都打一条会把日志刷爆
+        （实测用户日志被「未配置 API Key」这一行占满，见 CLAUDE.md 工程约束 #3
+        「轮询失败不刷屏」）。降级本身仍然留痕 —— 状态变化由 _mark_degraded
+        记 INFO，用户可见信息由 degraded_reason() → /yt列表 与订阅回复提供。
+        """
+        key = (reason, str(channel_id))
+        if key in self._logged_once:
+            logger.debug(msg)
+            return
+        self._logged_once.add(key)
+        logger.log(level, msg)
 
     # ------------------------------------------------------------ 主入口
 
@@ -252,8 +275,15 @@ class NotificationService:
         else:
             # data_api / auto 且未配置 Key → 直接走降级链
             if self.live_detect_mode == "auto":
-                logger.info(
-                    f"[YT] channel={state.channel_id} 未配置 API Key，回退网页数据源"
+                # 全局配置条件，不是事件：只记一次，否则每个频道每轮都刷一行
+                # （实测这就是把用户日志撑爆的那一行）。启动时已有一条 WARNING
+                # 说明整体情况，降级痕迹另有 _mark_degraded 负责。
+                self._log_once(
+                    "api_key_missing",
+                    "",
+                    "[YT] 未配置 API Key，自动模式下回退网页数据源"
+                    f"（首见 channel={state.channel_id}）",
+                    logging.INFO,
                 )
             snapshot = await self._fetch_degraded_snapshot(
                 state, "未配置 Data API Key"
@@ -276,8 +306,10 @@ class NotificationService:
                     state.channel_name = meta.title
                 state.name_from_api = True
                 if not state.uploads_playlist_id:
-                    logger.warning(
-                        f"[YT] channel={state.channel_id} 未取到 uploads 播放列表"
+                    self._log_once(
+                        "no_uploads_playlist",
+                        state.channel_id,
+                        f"[YT] channel={state.channel_id} 未取到 uploads 播放列表",
                     )
                     return None
             snapshot = await self.data_api.fetch_snapshot(
@@ -289,24 +321,36 @@ class NotificationService:
             self._clear_degraded(state.channel_id)
             return snapshot
         except QuotaExceededError as exc:
-            logger.error(
-                f"[YT] Data API 配额耗尽 channel={state.channel_id}: {exc}"
+            # 配额每天都会耗尽一次，是常态而非异常：不能每轮每频道都刷 ERROR
+            self._log_once(
+                "quota",
+                state.channel_id,
+                f"[YT] Data API 配额耗尽 channel={state.channel_id}: {exc}",
+                logging.ERROR,
             )
             return await self._fetch_degraded_snapshot(state, "Data API 配额耗尽")
         except InvalidApiKeyError as exc:
-            logger.error(f"[YT] API Key 无效，请检查配置: {exc}")
+            self._log_once(
+                "invalid_api_key",
+                "",
+                f"[YT] API Key 无效，请检查配置: {exc}",
+                logging.ERROR,
+            )
             return await self._fetch_degraded_snapshot(state, "API Key 无效")
         except ApiKeyMissingError as exc:
             # 每轮都会走到这里，只报一次免得刷屏
-            if not self._api_key_warned:
-                self._api_key_warned = True
-                logger.error(f"[YT] {exc} —— 改用网页兜底数据源")
-            else:
-                logger.debug(f"[YT] 仍未配置 API Key，跳过 channel={state.channel_id}")
+            self._log_once(
+                "api_key_missing",
+                "",
+                f"[YT] {exc} —— 改用网页兜底数据源",
+                logging.ERROR,
+            )
             return await self._fetch_degraded_snapshot(state, "未配置 Data API Key")
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                f"[YT] channel={state.channel_id} Data API 拉取失败: {exc!r}"
+            self._log_once(
+                "data_api_failed",
+                state.channel_id,
+                f"[YT] channel={state.channel_id} Data API 拉取失败: {exc!r}",
             )
             return await self._fetch_degraded_snapshot(state, "Data API 请求失败")
 
@@ -341,9 +385,11 @@ class NotificationService:
                 state.channel_name = snapshot.channel_name
             return snapshot
 
-        logger.warning(
+        self._log_once(
+            "page_fallback_failed",
+            state.channel_id,
             f"[YT] channel={state.channel_id} 网页兜底失败（{reason}），"
-            "继续回退 legacy feed"
+            "继续回退 legacy feed",
         )
         feed = await self._fetch_legacy_feed(state)
         if feed is not None:
@@ -378,8 +424,10 @@ class NotificationService:
                     live.channel_name = state.channel_name
                 notifications.extend(process_live(live, state, now_iso))
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    f"[YT] channel={state.channel_id} LiveBroadcasts 检测失败: {exc!r}"
+                self._log_once(
+                    "livebroadcasts_failed",
+                    state.channel_id,
+                    f"[YT] channel={state.channel_id} LiveBroadcasts 检测失败: {exc!r}",
                 )
 
         # 投稿始终走 Data API（若可用），否则降级链

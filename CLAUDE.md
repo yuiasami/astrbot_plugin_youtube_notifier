@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-AstrBot v4.28.0 插件：订阅 YouTube 频道（**支持 `@handle`**），直播上播/下播与新投稿以 **PIL 渲染的图片通知**发送，按会话（`event.unified_msg_origin`）隔离订阅。
+AstrBot v4.28.0 插件：订阅 YouTube 频道（**支持 `@handle`**），直播上播/下播与新投稿以通知形式发送——默认是 **PIL 渲染的图片通知**，可经 `notify.style=text` 切换为**纯文字通知**（见「工程约束」#8）；订阅按会话（`event.unified_msg_origin`）隔离。
 
 ## 数据源决策（已实测验证，勿擅自改动）
 
@@ -209,6 +209,16 @@ class ChannelState:
 2. **重试**：网络错误 / 5xx → 指数退避（1s/3s/9s + 抖动，最多 3 次）；429 → 尊重 `Retry-After`
 3. **限流**：Data API 每次调用都记账（`_charge`），区分 `quotaExceeded` 并记录；
    legacy feed 每频道 ≥30s 节流 + 浏览器 UA
+3.1 **重复性告警必须收敛**（`NotificationService._log_once`）。「降级」是长期状态
+   而非事件：`auto` 模式未配 Key、配额耗尽（每天都会发生）、Key 无效、网页兜底失败
+   等情形每轮每频道都会重新命中，若各打一条 INFO/WARNING 就会把日志刷爆
+   （真实踩坑：某用户日志被「未配置 API Key，回退网页数据源」一行占满，
+   10 频道 × 300s ≈ 每天 4–5 万行）。约定：同一 `(原因, channel_id)` 只按原级别
+   记一次，之后降 debug；`channel_id` 为空串表示全局条件（缺 Key / Key 无效）。
+   **但收敛 ≠ 静默**：降级留痕仍须保留 —— 状态变化由 `_mark_degraded` 记 INFO，
+   用户可见信息由 `degraded_reason()` → `/yt列表` 与订阅回复提供；
+   频道恢复（`_clear_degraded`）会清掉该频道的标记，下次再降级重新告警一次。
+   新增每轮都会命中的日志时，先想清楚它是不是「长期状态」。
 4. **异常**：单频道失败只记日志继续，不得中断整轮轮询；API 异常结构防御性解析 + `logger.warning`
 5. **日志**：状态变化、推送记录（会话、video）、配额消耗、WebSub 校验失败均需打日志
 6. **模块单职**：`services/` 不得 import `main.py`；渲染 / 网络 / 状态机解耦
